@@ -70,7 +70,7 @@
 
 - `paimon-common/.../table/BucketMode.java`：新增 `KEY_RANGE` 与 `RANGE_BUCKET = -3`。
 - `KeyValueFileStore.bucketMode()`（`:91-101`）：`case -3 → KEY_RANGE`。
-- `SchemaValidation:681`：新增 `isRangeBucketTable` 豁免（同 `isPostponeBucketTable:714`）；校验：必须主键表、不得设 `bucket-key`。
+- `SchemaValidation:681`：新增 `isRangeBucketTable` 豁免（同 `isPostponeBucketTable:714`）；校验：必须主键表、不得设 `bucket-key`、**分区键必须为空**（KEY_RANGE v1 与分区互斥——并发 split 的 strict-mode 安全论证依赖单一 EMPTY_ROW 分区，且 `changedPartitions` 不计入非 DV index 条目的分区，分区化会打开双 map 腐坏路径，详见 split 设计 §7.3）。
 - manifest 条目写 **`_TOTAL_BUCKETS = -3`**：`checkBucketKeepSame` 因 `totalBuckets <= 0` 跳过；`AbstractFileStoreWrite.scanExistingFileMetas` 因 restored(-3)==configured(-3) 通过——无需改冲突检测（已核实）。
 - 稀疏桶号安全（已核实）：`SnapshotReaderImpl.generateSplits` 按实际桶号分组；`withShard` 的 `bucket % n` 对稀疏号仍正确；`FileStorePathFactory.bucketPath` 接受任意非负 int。
 
@@ -235,14 +235,14 @@ KEY_RANGE 表是新 table feature，不保证旧版本 Paimon 读写兼容。
 
 ## 8. SPLIT / MERGE procedure（阶段二）
 
-### 8.1 `CALL sys.split_bucket(table, bucket => 123, split_key => NULL, max_rewrite_bytes => '2g')`
+### 8.1 `CALL sys.split_buckets(...)`（完整参数面与算法已移至独立的 split 设计文档 `range-bucket-split-design.md`，本节保留概要）
 
 1. 锁定最新快照 S、加载 map（epoch E）、校验桶存在。
 2. `FileStoreScan.withBucket(123)` 取该桶全部条目。
 3. **选分裂键（纯元数据）**：最高层 L_max 文件沿累计 fileSize 走到 50%，取该文件 `minKey`——L_max（字节大头）零跨界。
 4. 铸 left/right = nextBucketId, +1；epoch+1。
 5. 划分：`maxKey < splitKey` → left；`minKey >= splitKey` → right；跨界文件（L0 与少量中间层）逐文件单遍重写（同层、保留每行 sequence、纯复制）。
-6. **非跨界文件零拷贝 relabel**：克隆 `DataFileMeta`（前例 `PojoDataFileMeta.upgrade`），设 `_EXTERNAL_PATH` 指向原物理位置，以新桶号发条目。选 externalPath 而非 rename：与提交同原子、对象存储友好、后续 compaction 自然重写进真目录、逐步排干间接引用。
+6. **非跨界文件零拷贝 relabel**：用 `DataFileMeta.newExternalPath(String)` 克隆（裸 setter），新值按 split 设计 **不变量 I9** 计算：条目已有 externalPath 则原样继承，否则 = 源桶物理路径 + "/" + 文件名（含文件名的完整路径）。选 externalPath 而非 rename：与提交同原子、对象存储友好、后续 compaction 自然重写进真目录、逐步排干间接引用。
 7. **一次原子提交**（COMPACT kind + strict-mode）：DELETE 旧条目 + ADD relabel/重写条目 + map 替换（DELETE(map@E)/ADD(map@E+1)）。`checkKeyRange` 构造性通过。
 8. **L0 约束**：跨界 L0 超阈值则中止，提示先 `CALL sys.compact(..., buckets => '123')`。
 
@@ -372,7 +372,7 @@ hash_bits       = 128 (32 hex chars)
 | **M1 核心模式+元数据** | `KEY_RANGE`/`-3`；schema 校验豁免；`rangebucket/` 包；`RangeBucketRowKeyExtractor`；提交期陈旧桶号校验；Flink 入口显式拒绝 | `BucketMode.java`、`KeyValueFileStore.java`、`SchemaValidation.java`、`AbstractFileStoreTable.java`、`FileStoreCommitImpl.java`、Flink sink builder | ~2.5 kLOC |
 | **M2 Spark 读写** | `PaimonSparkWriter` KEY_RANGE 分支；`RangeBucketProcessor`；`RangeBucketSelectConverter`；`HostKeyCodec`（§7.1 规范）；`BatchedWriteRestore` | `PaimonSparkWriter.scala`、`BucketProcessor.scala`、`BucketSelectConverter.java`、`KeyValueFileStoreScan.java` | ~2.2 kLOC |
 | **M3 Bootstrap+运维面** | `init_range_buckets`；`RowkeyGrammar` 解析器；`RangeBucketsTable` 系统表；`CompactProcedure` `buckets` 参数 | `paimon-spark/.../procedure/`、`table/system/`、`CompactProcedure.java` | ~1.5 kLOC |
-| **M4 Manifest 优化** | 提交排序；`ManifestFileMerger` 按桶归并；`ManifestsReader.withBucketSetFilter` | `FileStoreCommitImpl.java`、`ManifestFileMerger.java`、`ManifestsReader.java` | ~1 kLOC |
+| **M4 Manifest 优化** | 提交排序；`ManifestFileMerger` 按桶归并；`ManifestsReader.withBucketSetFilter`；**COMPACT 提交冲突检测 base 读取的桶级限域**（现状已核实：无分区表 `readAllEntriesFromChangedPartitions` 无桶过滤读全表条目入 driver，10 万桶下每次 compaction 提交 ~5 GB 堆 + 全量 manifest 读；完整分析见 split 设计文档 §7.1） | `FileStoreCommitImpl.java`、`ManifestFileMerger.java`、`ManifestsReader.java`、`CommitScanner.java` | ~1.3 kLOC |
 
 **阶段一验收（全部实测）**：host 查询只读命中桶（manifest/文件读取量断言）；10 万桶写入/commit/planning 达 §10 指标；§10.2 压测矩阵 1/2/4/5 通过；sequence 确定性通过。
 
@@ -381,7 +381,7 @@ hash_bits       = 128 (32 hex chars)
 | 里程碑 | 内容 | 关键文件 | 规模 |
 |---|---|---|---|
 | **M5 引用安全矩阵** | `containsDataFile` skipper 修复；矩阵 14 项逐项代码证明 + 专项 IT | `FileDeletionBase.java` 等 | ~1 kLOC（含测试为主） |
-| **M6 Procedures** | `split_bucket` / `merge_buckets`（仿 `RescaleProcedure`+StrictMode）；跨界文件重写器；崩溃恢复 IT；split 前后 host 查询等价性对拍 | `paimon-spark/.../procedure/`、`rangebucket/RangeSplitFileRewriter` | ~2 kLOC |
+| **M6 Procedures** | `split_buckets` / `merge_buckets`（仿 `RescaleProcedure`+StrictMode）；跨界文件重写器；崩溃恢复 IT；split 前后 host 查询等价性对拍 | `paimon-spark/.../procedure/`、`rangebucket/RangeSplitFileRewriter` | ~2 kLOC |
 
 **测试策略**：`RangeBucketMapTest`（不变量/二分/序列化往返）；`HostKeyCodecTest`（§7.1 边角，property-based）；`PrimaryKeyFileStoreTableTest` 矩阵加 `bucket=-3`；Spark 端 `PaimonSparkTestBase` 派生套件（写/读/裁剪命中率/MERGE INTO/UPDATE/DELETE/time-travel）；§8.4 矩阵 IT；`paimon-benchmark` 10 万桶基准。
 
