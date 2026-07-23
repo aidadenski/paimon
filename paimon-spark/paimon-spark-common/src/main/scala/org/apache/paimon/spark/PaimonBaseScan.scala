@@ -18,6 +18,7 @@
 
 package org.apache.paimon.spark
 
+import org.apache.paimon.data.GenericRow
 import org.apache.paimon.globalindex.GlobalIndexResult
 import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.predicate.PredicateBuilder
@@ -44,11 +45,20 @@ abstract class PaimonBaseScan(table: InnerTable)
   private lazy val paimonMetricsRegistry: SparkMetricRegistry = SparkMetricRegistry()
 
   protected def getInputSplits: Array[Split] = {
-    val scan = readBuilder
+    var scan = readBuilder
       .newScan()
       .withGlobalIndexResult(evalGlobalIndexSearch())
       .asInstanceOf[InnerTableScan]
       .withMetricRegistry(paimonMetricsRegistry)
+
+    if (pushedBucketFilters.nonEmpty) {
+      // Prune buckets when planning splits. The pushed predicates are defined on the
+      // single-field row type (`__paimon_bucket` INT), and Spark still evaluates them
+      // on the metadata column after the scan, so this is only an optimization.
+      val bucketPredicate = PredicateBuilder.and(pushedBucketFilters.asJava)
+      scan = scan.withBucketFilter(
+        bucket => bucketPredicate.test(GenericRow.of(bucket.asInstanceOf[AnyRef])))
+    }
 
     val plan = scan.plan()
 

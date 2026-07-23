@@ -42,7 +42,7 @@ case class PaimonRecordReaderIterator(
       .isInstanceOf[DataSplit]
   ) {
     throw new RuntimeException(
-      "There need be DataSplit when path and index metadata columns are required")
+      "There need be DataSplit when partition and bucket metadata columns are required")
   }
 
   private val needMetadata = metadataColumns.nonEmpty
@@ -123,7 +123,7 @@ case class PaimonRecordReaderIterator(
           val dataRow = currentIterator.next()
           if (dataRow != null) {
             if (needMetadata) {
-              updateMetadataRow(currentIterator.asInstanceOf[FileRecordIterator[PaimonInternalRow]])
+              updateMetadataRow()
               currentResult = joinedRow.replace(dataRow, metadataRow)
             } else {
               currentResult = dataRow
@@ -150,12 +150,18 @@ case class PaimonRecordReaderIterator(
     }
   }
 
-  private def updateMetadataRow(fileRecordIterator: FileRecordIterator[PaimonInternalRow]): Unit = {
+  private def updateMetadataRow(): Unit = {
     metadataColumns.zipWithIndex.foreach {
       case (metadataColumn, index) =>
         metadataColumn.name match {
           case PaimonMetadataColumn.ROW_INDEX_COLUMN =>
-            metadataRow.setField(index, fileRecordIterator.returnedPosition())
+            // Guarded by readBatch: when path and index metadata columns are required,
+            // the iterator must be a FileRecordIterator.
+            metadataRow.setField(
+              index,
+              currentIterator
+                .asInstanceOf[FileRecordIterator[PaimonInternalRow]]
+                .returnedPosition())
           case PaimonMetadataColumn.FILE_PATH_COLUMN =>
             metadataRow.setField(index, BinaryString.fromString(lastFilePath.toString))
           case PaimonMetadataColumn.PARTITION_COLUMN =>

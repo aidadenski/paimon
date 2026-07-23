@@ -914,6 +914,53 @@ abstract class PaimonPushDownTestBase extends PaimonSparkTestBase with AdaptiveS
     }
   }
 
+  test("Paimon push down: __paimon_bucket filter as bucket pruning") {
+    // Bucket pruning relies on the V2 predicate push down, which requires Spark 3.3+.
+    assume(gteqSpark3_3)
+    withTable("T") {
+      spark.sql(s"""
+                   |CREATE TABLE T (id INT, name STRING)
+                   |TBLPROPERTIES ('primary-key'='id', 'bucket'='4')
+                   |""".stripMargin)
+
+      val rows = (1 to 16).map(i => (i, s"n$i"))
+      spark.sql(
+        s"INSERT INTO T VALUES ${rows.map { case (i, n) => s"($i, '$n')" }.mkString(", ")}")
+
+      val idToBucket = spark
+        .sql("SELECT id, __paimon_bucket FROM T")
+        .collect()
+        .map(r => (r.getInt(0), r.getInt(1)))
+        .toMap
+      val allBuckets = idToBucket.values.toSet
+      Assertions.assertTrue(allBuckets.size > 1)
+
+      val bucket = idToBucket(1)
+      val q = s"SELECT * FROM T WHERE __paimon_bucket = $bucket"
+
+      // Splits are pruned to the filtered bucket when planning the scan.
+      val scan = getPaimonScan(q)
+      Assertions.assertTrue(scan.description().contains("BucketFilters"))
+      val splits = scan.inputSplits
+      Assertions.assertTrue(splits.nonEmpty)
+      Assertions.assertTrue(splits.forall(_.asInstanceOf[DataSplit].bucket() == bucket))
+
+      // The filter is still evaluated on the metadata column, so results stay correct.
+      checkAnswer(
+        spark.sql(s"SELECT id, name FROM T WHERE __paimon_bucket = $bucket ORDER BY id"),
+        rows.filter(r => idToBucket(r._1) == bucket).map { case (i, n) => Row(i, n) }
+      )
+
+      // IN filter prunes to the selected buckets.
+      val twoBuckets = allBuckets.take(2)
+      val inSplits =
+        getPaimonScan(
+          s"SELECT * FROM T WHERE __paimon_bucket IN (${twoBuckets.mkString(", ")})").inputSplits
+      Assertions.assertTrue(
+        inSplits.forall(s => twoBuckets.contains(s.asInstanceOf[DataSplit].bucket())))
+    }
+  }
+
   private def getScanBuilder(tableName: String = "T"): ScanBuilder = {
     SparkTable(loadTable(tableName)).newScanBuilder(CaseInsensitiveStringMap.empty())
   }

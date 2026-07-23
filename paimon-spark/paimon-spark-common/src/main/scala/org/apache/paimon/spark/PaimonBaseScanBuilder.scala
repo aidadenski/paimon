@@ -23,6 +23,7 @@ import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.partition.PartitionPredicate.splitPartitionPredicatesAndDataPredicates
 import org.apache.paimon.predicate.{PartitionPredicateVisitor, Predicate, TopN, VectorSearch}
 import org.apache.paimon.predicate.FullTextSearch
+import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.table.{SpecialFields, Table}
 import org.apache.paimon.types.RowType
 
@@ -30,7 +31,7 @@ import org.apache.spark.sql.connector.expressions.filter.{Predicate => SparkPred
 import org.apache.spark.sql.connector.read.{SupportsPushDownLimit, SupportsPushDownRequiredColumns, SupportsPushDownV2Filters}
 import org.apache.spark.sql.types.StructType
 
-import java.util.{List => JList}
+import java.util.{Collections, List => JList}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -51,6 +52,7 @@ abstract class PaimonBaseScanBuilder
 
   protected var pushedPartitionFilters: Array[PartitionPredicate] = Array.empty
   protected var pushedDataFilters: Array[Predicate] = Array.empty
+  protected var pushedBucketFilters: Array[Predicate] = Array.empty
   protected var pushedLimit: Option[Int] = None
   protected var pushedTopN: Option[TopN] = None
   protected var pushedVectorSearch: Option[VectorSearch] = None
@@ -66,6 +68,7 @@ abstract class PaimonBaseScanBuilder
     val pushable = mutable.ArrayBuffer.empty[SparkPredicate]
     val pushablePartitionDataFilters = mutable.ArrayBuffer.empty[Predicate]
     val pushableDataFilters = mutable.ArrayBuffer.empty[Predicate]
+    val pushableBucketFilters = mutable.ArrayBuffer.empty[Predicate]
     val postScan = mutable.ArrayBuffer.empty[SparkPredicate]
 
     var newRowType = rowType
@@ -76,6 +79,11 @@ abstract class PaimonBaseScanBuilder
       newRowType = SpecialFields.rowTypeWithRowTracking(newRowType);
     }
     val converter = SparkV2FilterConverter(newRowType)
+    // Predicates on the `__paimon_bucket` metadata column can prune buckets when planning
+    // splits. They are converted against a single-field row type and are still evaluated
+    // by Spark after the scan, so pruning is a best-effort optimization.
+    val bucketFieldConverter = SparkV2FilterConverter(
+      new RowType(Collections.singletonList(PaimonMetadataColumn.BUCKET.toPaimonDataField)))
     val partitionPredicateVisitor = new PartitionPredicateVisitor(partitionKeys)
     predicates.foreach {
       predicate =>
@@ -89,6 +97,12 @@ abstract class PaimonBaseScanBuilder
               postScan.append(predicate)
             }
           case None =>
+            bucketFieldConverter.convert(predicate) match {
+              case Some(bucketPredicate) =>
+                pushable.append(predicate)
+                pushableBucketFilters.append(bucketPredicate)
+              case None =>
+            }
             postScan.append(predicate)
         }
     }
@@ -107,6 +121,9 @@ abstract class PaimonBaseScanBuilder
     }
     if (pushableDataFilters.nonEmpty) {
       this.pushedDataFilters = pushableDataFilters.toArray
+    }
+    if (pushableBucketFilters.nonEmpty) {
+      this.pushedBucketFilters = pushableBucketFilters.toArray
     }
     if (postScan.nonEmpty) {
       this.hasPostScanPredicates = true

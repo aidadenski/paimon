@@ -152,7 +152,8 @@ class PaimonScanBuilder(val table: InnerTable)
           pushedTopN,
           vectorSearch,
           fullTextSearch,
-          acceptedVariantExtractions
+          acceptedVariantExtractions,
+          pushedBucketFilters
         )
     }
   }

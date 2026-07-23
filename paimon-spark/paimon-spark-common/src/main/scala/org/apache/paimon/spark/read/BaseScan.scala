@@ -48,6 +48,7 @@ trait BaseScan extends Scan with SupportsReportStatistics with Logging {
   // Push down
   def pushedPartitionFilters: Seq[PartitionPredicate]
   def pushedDataFilters: Seq[Predicate]
+  def pushedBucketFilters: Seq[Predicate] = Seq.empty
   def pushedLimit: Option[Int] = None
   def pushedTopN: Option[TopN] = None
   def pushedVectorSearch: Option[VectorSearch] = None
@@ -190,6 +191,11 @@ trait BaseScan extends Scan with SupportsReportStatistics with Logging {
     } else {
       ""
     }
+    val pushedBucketFiltersStr = if (pushedBucketFilters.nonEmpty) {
+      ", BucketFilters: [" + pushedBucketFilters.mkString(",") + "]"
+    } else {
+      ""
+    }
     val pushedVariantsStr =
       if (pushedVariantExtractions.isEmpty) ""
       else
@@ -201,6 +207,7 @@ trait BaseScan extends Scan with SupportsReportStatistics with Logging {
       pushedPartitionFiltersStr +
       pushedRuntimePartitionFiltersStr +
       pushedDataFiltersStr +
+      pushedBucketFiltersStr +
       pushedTopN.map(topN => s", TopN: [$topN]").getOrElse("") +
       pushedLimit.map(limit => s", Limit: [$limit]").getOrElse("") +
       pushedVectorSearch.map(vs => s", VectorSearch: [$vs]").getOrElse("") +

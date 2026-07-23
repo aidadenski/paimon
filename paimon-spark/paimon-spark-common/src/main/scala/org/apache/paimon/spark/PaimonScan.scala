@@ -45,6 +45,7 @@ case class PaimonScan(
     override val pushedVectorSearch: Option[VectorSearch],
     override val pushedFullTextSearch: Option[FullTextSearch] = None,
     override val pushedVariantExtractions: Map[Seq[String], Seq[VariantExtractionInfo]] = Map.empty,
+    override val pushedBucketFilters: Seq[Predicate] = Seq.empty,
     bucketedScanDisabled: Boolean = false)
   extends PaimonBaseScan(table)
   with SupportsReportPartitioning

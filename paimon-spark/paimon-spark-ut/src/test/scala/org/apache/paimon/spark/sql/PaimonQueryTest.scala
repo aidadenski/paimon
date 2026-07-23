@@ -88,6 +88,39 @@ class PaimonQueryTest extends PaimonSparkTestBase {
     }
   }
 
+  test("Query partition and bucket metadata columns on primary key table with merge read") {
+    withTable("T") {
+      spark.sql(
+        """
+          |CREATE TABLE T (id INT, name STRING)
+          |TBLPROPERTIES ('primary-key'='id', 'bucket'='2', 'merge-engine'='partial-update', 'write-only'='true')
+          |""".stripMargin)
+
+      spark.sql("INSERT INTO T VALUES (1, 'x1'), (2, 'x2'), (3, 'x3'), (4, 'x4')")
+      // The second commit overlaps the first one, so the splits require merge read.
+      spark.sql("INSERT INTO T VALUES (1, 'y1'), (3, 'y3')")
+
+      checkAnswer(
+        spark.sql("SELECT id, name FROM T ORDER BY id"),
+        Row(1, "y1") :: Row(2, "x2") :: Row(3, "y3") :: Row(4, "x4") :: Nil)
+
+      val withBucket =
+        spark.sql("SELECT id, name, __paimon_bucket FROM T ORDER BY id").collect()
+      assert(withBucket.map(r => (r.getInt(0), r.getString(1))).toSeq ==
+        Seq((1, "y1"), (2, "x2"), (3, "y3"), (4, "x4")))
+      assert(withBucket.map(_.getInt(2)).forall(b => b == 0 || b == 1))
+
+      // Filtering on one bucket returns exactly the rows of that bucket.
+      withBucket.groupBy(_.getInt(2)).foreach {
+        case (bucket, rows) =>
+          checkAnswer(
+            spark.sql(
+              s"SELECT name, count(*) FROM T WHERE __paimon_bucket = $bucket GROUP BY name"),
+            rows.map(r => Row(r.getString(1), 1L)).toSeq)
+      }
+    }
+  }
+
   test("Query metadata columns for partition") {
     withTable("T") {
       spark.sql("""
